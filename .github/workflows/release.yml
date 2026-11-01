@@ -1,0 +1,25 @@
+name: release
+# Git-tag registries (Go proxy, SwiftPM, Packagist, UPM/OpenUPM, Godot, Unreal, GTM) serve the tag itself;
+# this attests the source archive and attaches it to a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+permissions: {}
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Source archive
+        run: git archive --format=tar.gz --prefix="lucida-go-${GITHUB_REF_NAME}/" -o "lucida-go-${GITHUB_REF_NAME}.tar.gz" "$GITHUB_REF_NAME"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "lucida-go-*.tar.gz"
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "lucida-go-${GITHUB_REF_NAME}.tar.gz" --generate-notes --verify-tag
