@@ -35,6 +35,8 @@ type resolved struct {
 	payload   any
 	locally   bool
 	requestID string
+	reason    string
+	condIdx   int
 }
 
 func (o FlagOptions) evalContext(id string) EvalContext {
@@ -70,14 +72,45 @@ func (c *Client) Ready() <-chan struct{} { return c.ready }
 
 // ReloadFeatureFlags fetches flag definitions now (ETag aware). The previous definitions are kept on error.
 func (c *Client) ReloadFeatureFlags(ctx context.Context) error {
+	changed, err := c.fetchDefinitions(ctx)
+	c.flagMu.RLock()
+	onChange, onStale := c.onChange, c.onStale
+	c.flagMu.RUnlock()
+	if err != nil && onStale != nil {
+		onStale(err)
+	} else if changed && onChange != nil {
+		onChange()
+	}
+	return err
+}
+
+// OnFlagsChange registers callbacks: changed runs after a reload installed new definitions, stale after a
+// reload (or the flag stream) failed. They run on the loading goroutine; keep them quick. Nil clears one.
+func (c *Client) OnFlagsChange(changed func(), stale func(error)) {
+	c.flagMu.Lock()
+	c.onChange, c.onStale = changed, stale
+	c.flagMu.Unlock()
+}
+
+func (c *Client) fireStale(err error) {
+	c.flagMu.RLock()
+	f := c.onStale
+	c.flagMu.RUnlock()
+	if f != nil {
+		f(err)
+	}
+}
+
+// fetchDefinitions is one ETag-aware fetch; changed is true when new definitions were installed.
+func (c *Client) fetchDefinitions(ctx context.Context) (changed bool, err error) {
 	if c.secret == "" || c.cfg.Disabled {
-		return nil
+		return false, nil
 	}
 	if defs, ok := adoptCachedFlags(ctx, c.cfg.FlagDefinitionCache); ok {
 		c.flagMu.Lock()
 		c.defs, c.haveDefs = defs, true
 		c.flagMu.Unlock()
-		return nil
+		return true, nil
 	}
 	c.flagMu.RLock()
 	etag := c.etag
@@ -86,7 +119,7 @@ func (c *Client) ReloadFeatureFlags(ctx context.Context) error {
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.host+"/v1/flags/definitions", nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.secret)
 	if etag != "" {
@@ -95,15 +128,15 @@ func (c *Client) ReloadFeatureFlags(ctx context.Context) error {
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.logf("flag definitions poll failed: %v", err)
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotModified {
-		return nil
+		return false, nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		c.logf("flag definitions poll: status %d", resp.StatusCode)
-		return fmt.Errorf("lucida: flag definitions: status %d", resp.StatusCode)
+		return false, fmt.Errorf("lucida: flag definitions: status %d", resp.StatusCode)
 	}
 	var body struct {
 		Flags *[]Flag `json:"flags"`
@@ -111,13 +144,13 @@ func (c *Client) ReloadFeatureFlags(ctx context.Context) error {
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err := json.Unmarshal(raw, &body); err != nil || body.Flags == nil {
 		c.logf("flag definitions poll: bad body")
-		return fmt.Errorf("lucida: flag definitions: bad body")
+		return false, fmt.Errorf("lucida: flag definitions: bad body")
 	}
 	c.flagMu.Lock()
 	c.defs, c.haveDefs, c.etag = *body.Flags, true, resp.Header.Get("ETag")
 	c.flagMu.Unlock()
 	publishCachedFlags(ctx, c.cfg.FlagDefinitionCache, *body.Flags)
-	return nil
+	return true, nil
 }
 
 func (c *Client) local(id string, o FlagOptions) map[string]FlagResult {
@@ -190,6 +223,9 @@ func (c *Client) remote(ctx context.Context, id string, o FlagOptions, keys []st
 			Variant string `json:"variant"`
 			Value   any    `json:"value"`
 			Payload any    `json:"payload"`
+			Reason  string `json:"reason"`
+			// ConditionIndex is -1 when no condition decided the result.
+			ConditionIndex *int `json:"condition_index"`
 		} `json:"flags"`
 		RequestID    string `json:"request_id"`
 		QuotaLimited bool   `json:"quota_limited"`
@@ -209,7 +245,11 @@ func (c *Client) remote(ctx context.Context, id string, o FlagOptions, keys []st
 				v = f.Variant
 			}
 		}
-		out[k] = resolved{v, f.Payload, false, resp.RequestID}
+		ci := -1
+		if f.ConditionIndex != nil {
+			ci = *f.ConditionIndex
+		}
+		out[k] = resolved{v, f.Payload, false, resp.RequestID, f.Reason, ci}
 	}
 	return out
 }
@@ -223,13 +263,18 @@ func orEmpty[M ~map[K]V, K comparable, V any](m M) M {
 
 func (c *Client) resolve(ctx context.Context, key, id string, o FlagOptions) (resolved, bool) {
 	if r, ok := c.local(id, o)[key]; ok && r.Reason != ReasonRequiresServer {
-		return resolved{r.Value, r.Payload, true, ""}, true
+		return resolved{r.Value, r.Payload, true, "", r.Reason, r.ConditionIndex}, true
 	}
-	if o.OnlyEvaluateLocally {
-		return resolved{}, false
+	if !o.OnlyEvaluateLocally {
+		if r, ok := c.remote(ctx, id, o, []string{key})[key]; ok {
+			return r, true
+		}
 	}
-	r, ok := c.remote(ctx, id, o, []string{key})[key]
-	return r, ok
+	// Nothing decided the flag: the init-time Fallbacks value, if any (nothing was assigned, so no exposure).
+	if v, ok := c.cfg.Fallbacks[key]; ok {
+		return resolved{value: v, locally: true, reason: ReasonFallback, condIdx: -1}, true
+	}
+	return resolved{}, false
 }
 
 // GetFeatureFlag returns the flag value (false, true or a variant key); ok is false when the flag is
@@ -243,20 +288,59 @@ func (c *Client) GetFeatureFlag(ctx context.Context, key, distinctID string, o F
 	if !ok {
 		return o.DefaultValue, false
 	}
-	if !o.NoExposure && c.seen.add(fmt.Sprintf("%s\x00%s\x00%v", distinctID, key, r.value)) {
-		props := map[string]any{"$feature_flag": key, "$feature_flag_response": r.value, "locally_evaluated": r.locally}
-		if r.requestID != "" {
-			props["$feature_flag_request_id"] = r.requestID
-		}
-		for _, ev := range []string{"$feature_flag_called", "$exposure"} {
-			p := make(map[string]any, len(props))
-			for k, v := range props {
-				p[k] = v
-			}
-			c.Capture(CaptureInput{DistinctID: distinctID, Event: ev, Properties: p})
-		}
+	if !o.NoExposure {
+		c.exposure(distinctID, key, r)
 	}
 	return r.value, true
+}
+
+// exposure emits $feature_flag_called and $exposure once per (distinctID, flag, value); fallbacks emit nothing.
+func (c *Client) exposure(distinctID, key string, r resolved) {
+	if r.reason == ReasonFallback || !c.seen.add(fmt.Sprintf("%s\x00%s\x00%v", distinctID, key, r.value)) {
+		return
+	}
+	props := map[string]any{"$feature_flag": key, "$feature_flag_response": r.value, "locally_evaluated": r.locally}
+	if r.requestID != "" {
+		props["$feature_flag_request_id"] = r.requestID
+	}
+	for _, ev := range []string{"$feature_flag_called", "$exposure"} {
+		p := make(map[string]any, len(props))
+		for k, v := range props {
+			p[k] = v
+		}
+		c.Capture(CaptureInput{DistinctID: distinctID, Event: ev, Properties: p})
+	}
+}
+
+// FlagDetails is a flag read with the evidence behind it.
+type FlagDetails struct {
+	Key, Variant string
+	Value        any
+	Payload      any
+	// Reason is the raw Lucida reason (ReasonConditionMatch, ... or ReasonFallback).
+	Reason string
+	// ConditionIndex is the deciding condition, -1 when none.
+	ConditionIndex   int
+	RequestID        string
+	EvaluatedLocally bool
+}
+
+// GetFeatureFlagDetails is GetFeatureFlag with payload, reason and provenance (same exposure events
+// unless o.NoExposure; never for fallbacks). ok is false when nothing (not even a Config.Fallbacks entry) decides the flag.
+func (c *Client) GetFeatureFlagDetails(ctx context.Context, key, distinctID string, o FlagOptions) (FlagDetails, bool) {
+	if c.cfg.Disabled {
+		return FlagDetails{}, false
+	}
+	r, ok := c.resolve(ctx, key, distinctID, o)
+	if !ok {
+		return FlagDetails{}, false
+	}
+	if !o.NoExposure {
+		c.exposure(distinctID, key, r)
+	}
+	v, _ := r.value.(string)
+	return FlagDetails{Key: key, Value: r.value, Payload: r.payload, Variant: v, Reason: r.reason,
+		ConditionIndex: r.condIdx, RequestID: r.requestID, EvaluatedLocally: r.locally}, true
 }
 
 // IsFeatureEnabled is GetFeatureFlag reduced to "on" (true or any variant).

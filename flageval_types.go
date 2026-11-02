@@ -80,6 +80,7 @@ const (
 	ReasonNamespaceExcluded   = "namespace_excluded"
 	ReasonStickyBucket        = "sticky_bucket"        // a stored assignment decided (see sticky.go)
 	ReasonOutOfRollout        = "out_of_rollout"       // early_exit: filters matched, rollout hash excluded
+	ReasonFallback            = "fallback"             // served from Config.Fallbacks; nothing decided the flag
 	ReasonAppContextExcluded  = "app_context_excluded" // flag's app_contexts do not include the request's
 )
 

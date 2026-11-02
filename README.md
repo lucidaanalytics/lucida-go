@@ -68,6 +68,12 @@ serves, with `{{var}}` placeholders filled, or `fallback` (`Enabled == false`) w
 `GetFeatureFlag` emits `$feature_flag_called` and `$exposure` once per `(distinctID, flag, value)` (bounded LRU, 10 000;
 `NoExposure` disables it). `GetFeatureFlagPayload` and `GetAllFlags` never emit.
 
+Fallbacks: `Config.Fallbacks` (`map[string]any`) is served with reason `"fallback"` (and no exposure event) when nothing
+decides a flag: network error, cold start, quota limit or unknown key. It beats `FlagOptions.DefaultValue`.
+`GetFeatureFlagDetails(ctx, key, distinctID, o)` returns `FlagDetails{Value, Payload, Variant, Reason, ConditionIndex,
+RequestID, EvaluatedLocally}` (same exposure rules as `GetFeatureFlag`). `OnFlagsChange(changed, stale)` registers
+reload hooks (used by the OpenFeature provider for its events).
+
 ## Tests
 
 ```sh

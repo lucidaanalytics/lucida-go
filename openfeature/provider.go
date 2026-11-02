@@ -1,6 +1,8 @@
 // Package lucidaprovider is an OpenFeature (Apache-2.0) server provider over the Lucida Go SDK.
-// The targeting key is the Lucida distinct id; every other context attribute becomes a person property.
-// Variants resolve to the string value, payload flags to Object evaluations.
+// The targeting key is the Lucida distinct id; the `groups` and `groupProperties` attributes map to Lucida
+// groups, every other attribute becomes a person property. Variants resolve to the string value, payload
+// flags to Object evaluations. Reasons follow testdata/openfeature/reasons.json; flagMetadata carries
+// lucidaReason, conditionIndex, requestId and evaluatedLocally.
 package lucidaprovider
 
 import (
@@ -14,20 +16,56 @@ import (
 
 // Flags is the slice of *lucida.Client the provider needs.
 type Flags interface {
-	GetFeatureFlag(ctx context.Context, key, distinctID string, o lucida.FlagOptions) (any, bool)
-	GetFeatureFlagPayload(ctx context.Context, key, distinctID string, o lucida.FlagOptions) any
+	GetFeatureFlagDetails(ctx context.Context, key, distinctID string, o lucida.FlagOptions) (lucida.FlagDetails, bool)
+	Capture(in lucida.CaptureInput)
+	OnFlagsChange(changed func(), stale func(error))
 }
 
-// Provider implements openfeature.FeatureProvider.
-type Provider struct{ flags Flags }
+// Provider implements openfeature.FeatureProvider, StateHandler, EventHandler and Tracker.
+type Provider struct {
+	flags Flags
+	ev    events
+}
 
-var _ openfeature.FeatureProvider = (*Provider)(nil)
+var (
+	_ openfeature.FeatureProvider = (*Provider)(nil)
+	_ openfeature.StateHandler    = (*Provider)(nil)
+	_ openfeature.EventHandler    = (*Provider)(nil)
+	_ openfeature.Tracker         = (*Provider)(nil)
+)
 
-// New wraps a Lucida client (or any Flags).
-func New(flags Flags) *Provider { return &Provider{flags: flags} }
+// New wraps a Lucida client (or any Flags) and subscribes to its definition reloads.
+func New(flags Flags) *Provider {
+	p := &Provider{flags: flags, ev: newEvents()}
+	flags.OnFlagsChange(p.ev.changed, p.ev.stale)
+	return p
+}
 
 func (p *Provider) Metadata() openfeature.Metadata { return openfeature.Metadata{Name: "lucida"} }
 func (p *Provider) Hooks() []openfeature.Hook      { return nil }
+
+// reasonTable mirrors testdata/openfeature/reasons.json (the test compares them).
+var reasonTable = map[string]openfeature.Reason{
+	"condition_match": openfeature.TargetingMatchReason, "sticky_bucket": openfeature.CachedReason,
+	"no_condition_match": openfeature.DefaultReason, "out_of_rollout": openfeature.DefaultReason,
+	"holdout": openfeature.DefaultReason, "namespace_excluded": openfeature.DefaultReason,
+	"no_bucketing_key": openfeature.DefaultReason, "prerequisite_failed": openfeature.DefaultReason,
+	"prerequisite_missing": openfeature.DefaultReason, "prerequisite_cycle": openfeature.ErrorReason,
+	"inactive": openfeature.DisabledReason, "kill_switch": openfeature.DisabledReason,
+	"app_context_excluded": openfeature.DisabledReason, "preview": openfeature.StaticReason,
+	"user_preview": openfeature.StaticReason, "fallback": openfeature.DefaultReason,
+}
+
+func ofReason(raw string, value any) openfeature.Reason {
+	r, ok := reasonTable[raw]
+	if !ok {
+		return openfeature.UnknownReason
+	}
+	if _, isStr := value.(string); isStr && raw == "condition_match" {
+		return openfeature.SplitReason
+	}
+	return r
+}
 
 func fail(err openfeature.ResolutionError) openfeature.ProviderResolutionDetail {
 	return openfeature.ProviderResolutionDetail{ResolutionError: err, Reason: openfeature.ErrorReason}
@@ -37,95 +75,110 @@ func mismatch(flag, want string) openfeature.ProviderResolutionDetail {
 	return fail(openfeature.NewTypeMismatchResolutionError("flag " + flag + " is not " + want))
 }
 
-// resolve returns the raw flag value, or false with the detail describing why there is none.
-func (p *Provider) resolve(ctx context.Context, flag string, fc openfeature.FlattenedContext) (any, string, openfeature.ProviderResolutionDetail, bool) {
-	id, _ := fc[openfeature.TargetingKey].(string)
+func metadata(d lucida.FlagDetails) openfeature.FlagMetadata {
+	m := openfeature.FlagMetadata{"lucidaReason": d.Reason, "evaluatedLocally": d.EvaluatedLocally}
+	if d.ConditionIndex >= 0 {
+		m["conditionIndex"] = d.ConditionIndex
+	}
+	if d.RequestID != "" {
+		m["requestId"] = d.RequestID
+	}
+	return m
+}
+
+// resolve returns the Lucida details, or false with the detail describing why there are none.
+func (p *Provider) resolve(ctx context.Context, flag string, fc openfeature.FlattenedContext) (lucida.FlagDetails, openfeature.ProviderResolutionDetail, bool) {
+	id, o := splitContext(fc)
 	if id == "" {
-		return nil, "", fail(openfeature.NewTargetingKeyMissingResolutionError("targetingKey (distinct id) is required")), false
+		return lucida.FlagDetails{}, fail(openfeature.NewTargetingKeyMissingResolutionError("targetingKey (distinct id) is required")), false
 	}
-	props := map[string]any{}
-	for k, v := range fc {
-		if k != openfeature.TargetingKey {
-			props[k] = v
-		}
-	}
-	v, ok := p.flags.GetFeatureFlag(ctx, flag, id, lucida.FlagOptions{PersonProperties: props})
+	d, ok := p.flags.GetFeatureFlagDetails(ctx, flag, id, o)
 	if !ok {
-		return nil, id, fail(openfeature.NewFlagNotFoundResolutionError("flag " + flag + " not found")), false
+		return d, fail(openfeature.NewFlagNotFoundResolutionError("flag " + flag + " not found")), false
 	}
-	d := openfeature.ProviderResolutionDetail{Reason: openfeature.TargetingMatchReason}
-	if s, isStr := v.(string); isStr {
-		d.Variant = s
-	}
-	return v, id, d, true
+	return d, openfeature.ProviderResolutionDetail{Reason: ofReason(d.Reason, d.Value), Variant: d.Variant, FlagMetadata: metadata(d)}, true
 }
 
 func (p *Provider) BooleanEvaluation(ctx context.Context, flag string, def bool, fc openfeature.FlattenedContext) openfeature.BoolResolutionDetail {
-	v, _, d, ok := p.resolve(ctx, flag, fc)
+	d, pd, ok := p.resolve(ctx, flag, fc)
 	if !ok {
-		return openfeature.BoolResolutionDetail{Value: def, ProviderResolutionDetail: d}
+		return openfeature.BoolResolutionDetail{Value: def, ProviderResolutionDetail: pd}
 	}
-	switch x := v.(type) {
+	switch x := d.Value.(type) {
 	case bool:
-		return openfeature.BoolResolutionDetail{Value: x, ProviderResolutionDetail: d}
+		return openfeature.BoolResolutionDetail{Value: x, ProviderResolutionDetail: pd}
 	case string: // a multivariate flag is "on" for any variant, mirroring isFeatureEnabled
-		return openfeature.BoolResolutionDetail{Value: true, ProviderResolutionDetail: d}
+		return openfeature.BoolResolutionDetail{Value: true, ProviderResolutionDetail: pd}
 	}
 	return openfeature.BoolResolutionDetail{Value: def, ProviderResolutionDetail: mismatch(flag, "boolean")}
 }
 
 func (p *Provider) StringEvaluation(ctx context.Context, flag string, def string, fc openfeature.FlattenedContext) openfeature.StringResolutionDetail {
-	v, _, d, ok := p.resolve(ctx, flag, fc)
+	d, pd, ok := p.resolve(ctx, flag, fc)
 	if !ok {
-		return openfeature.StringResolutionDetail{Value: def, ProviderResolutionDetail: d}
+		return openfeature.StringResolutionDetail{Value: def, ProviderResolutionDetail: pd}
 	}
-	s, isStr := v.(string)
+	s, isStr := d.Value.(string)
 	if !isStr {
 		return openfeature.StringResolutionDetail{Value: def, ProviderResolutionDetail: mismatch(flag, "a string variant")}
 	}
-	return openfeature.StringResolutionDetail{Value: s, ProviderResolutionDetail: d}
+	return openfeature.StringResolutionDetail{Value: s, ProviderResolutionDetail: pd}
 }
 
-// payload resolves the flag then reads its payload (without a second exposure event).
-func (p *Provider) payload(ctx context.Context, flag string, fc openfeature.FlattenedContext) (any, openfeature.ProviderResolutionDetail, bool) {
-	_, id, d, ok := p.resolve(ctx, flag, fc)
-	if !ok {
-		return nil, d, false
+// payload is the flag's payload; a fallback has none, so its value stands in.
+func payload(d lucida.FlagDetails) any {
+	if d.Reason == lucida.ReasonFallback {
+		return d.Value
 	}
-	return p.flags.GetFeatureFlagPayload(ctx, flag, id, lucida.FlagOptions{NoExposure: true}), d, true
+	return d.Payload
+}
+
+func toFloat(v any) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case float32:
+		return float64(x), true
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	}
+	return 0, false
 }
 
 func (p *Provider) FloatEvaluation(ctx context.Context, flag string, def float64, fc openfeature.FlattenedContext) openfeature.FloatResolutionDetail {
-	pl, d, ok := p.payload(ctx, flag, fc)
+	d, pd, ok := p.resolve(ctx, flag, fc)
 	if !ok {
-		return openfeature.FloatResolutionDetail{Value: def, ProviderResolutionDetail: d}
+		return openfeature.FloatResolutionDetail{Value: def, ProviderResolutionDetail: pd}
 	}
-	f, isNum := pl.(float64)
+	f, isNum := toFloat(payload(d))
 	if !isNum {
 		return openfeature.FloatResolutionDetail{Value: def, ProviderResolutionDetail: mismatch(flag, "a numeric payload")}
 	}
-	return openfeature.FloatResolutionDetail{Value: f, ProviderResolutionDetail: d}
+	return openfeature.FloatResolutionDetail{Value: f, ProviderResolutionDetail: pd}
 }
 
 func (p *Provider) IntEvaluation(ctx context.Context, flag string, def int64, fc openfeature.FlattenedContext) openfeature.IntResolutionDetail {
-	pl, d, ok := p.payload(ctx, flag, fc)
+	d, pd, ok := p.resolve(ctx, flag, fc)
 	if !ok {
-		return openfeature.IntResolutionDetail{Value: def, ProviderResolutionDetail: d}
+		return openfeature.IntResolutionDetail{Value: def, ProviderResolutionDetail: pd}
 	}
-	f, isNum := pl.(float64)
+	f, isNum := toFloat(payload(d))
 	if !isNum || f != math.Trunc(f) {
 		return openfeature.IntResolutionDetail{Value: def, ProviderResolutionDetail: mismatch(flag, "an integer payload")}
 	}
-	return openfeature.IntResolutionDetail{Value: int64(f), ProviderResolutionDetail: d}
+	return openfeature.IntResolutionDetail{Value: int64(f), ProviderResolutionDetail: pd}
 }
 
 func (p *Provider) ObjectEvaluation(ctx context.Context, flag string, def any, fc openfeature.FlattenedContext) openfeature.InterfaceResolutionDetail {
-	pl, d, ok := p.payload(ctx, flag, fc)
+	d, pd, ok := p.resolve(ctx, flag, fc)
 	if !ok {
-		return openfeature.InterfaceResolutionDetail{Value: def, ProviderResolutionDetail: d}
+		return openfeature.InterfaceResolutionDetail{Value: def, ProviderResolutionDetail: pd}
 	}
+	pl := payload(d)
 	if pl == nil {
 		return openfeature.InterfaceResolutionDetail{Value: def, ProviderResolutionDetail: mismatch(flag, "an object payload")}
 	}
-	return openfeature.InterfaceResolutionDetail{Value: pl, ProviderResolutionDetail: d}
+	return openfeature.InterfaceResolutionDetail{Value: pl, ProviderResolutionDetail: pd}
 }

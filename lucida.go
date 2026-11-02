@@ -64,6 +64,9 @@ type Config struct {
 	// OnError is called when a batch is given up on (non-retryable status or retries exhausted) and when
 	// Capture is given no distinct id. It runs on the delivery goroutine; keep it quick.
 	OnError func(err error, events []CapturedEvent)
+	// Fallbacks maps flag key to the value served (reason ReasonFallback, no exposure event) when nothing
+	// decides the flag: network error, cold start, quota limit or unknown key. Beats FlagOptions.DefaultValue.
+	Fallbacks map[string]any
 }
 
 // CaptureInput is one event. Timestamp and UUID default to now / a fresh UUIDv7.
@@ -134,6 +137,8 @@ type Client struct {
 	haveDefs bool
 	etag     string
 	seen     *lruSet
+	onChange func()
+	onStale  func(error)
 
 	identity identityState // super properties and identify dedupe (identity.go)
 

@@ -3,6 +3,7 @@ package lucida
 import (
 	"bufio"
 	"context"
+	"errors"
 	"math/rand/v2"
 	"net/http"
 	"strings"
@@ -24,6 +25,9 @@ func (c *Client) streamLoop() {
 			attempt = 0
 		}
 		c.streaming.Store(false)
+		if ctx.Err() == nil {
+			c.fireStale(errors.New("lucida: flag stream down"))
+		}
 		d := min(base<<min(attempt, 6), 30*time.Second)
 		d = d/2 + time.Duration(rand.Int64N(int64(d/2)+1))
 		select {
