@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -33,10 +34,30 @@ func (f *fakeFlags) OnFlagsChange(c func(), s func(error)) {
 
 var fc = openfeature.FlattenedContext{openfeature.TargetingKey: "u1"}
 
+// testdata is $LUCIDA_TESTDATA/rel, else the nearest testdata/rel above the working dir (monorepo and mirror both work).
+func testdata(t *testing.T, rel string) string {
+	if d := os.Getenv("LUCIDA_TESTDATA"); d != "" {
+		return filepath.Join(d, rel)
+	}
+	dir, _ := os.Getwd()
+	for {
+		if p := filepath.Join(dir, "testdata", rel); fileExists(p) {
+			return p
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("testdata/%s not found", rel)
+		}
+		dir = parent
+	}
+}
+
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
+
 func TestReasonsMatchSharedTable(t *testing.T) {
-	raw, err := os.ReadFile("../../../testdata/openfeature/reasons.json")
+	raw, err := os.ReadFile(testdata(t, "openfeature/reasons.json"))
 	if err != nil {
-		t.Skip("shared reasons table not available outside the monorepo")
+		t.Fatal(err)
 	}
 	var table struct {
 		Reasons map[string]struct {
