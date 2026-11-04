@@ -106,10 +106,26 @@ func (c *Client) CaptureContext(ctx context.Context, in CaptureInput) {
 	if geo := c.cfg.DisableGeoip; (in.DisableGeoip == nil && geo) || (in.DisableGeoip != nil && *in.DisableGeoip) {
 		props["$geoip_disable"] = true
 	}
-	in, async := c.withFlags(in)
-	if async {
+	in, remote := c.withFlags(in)
+	prev, mine := c.order.enter(remote != nil)
+	if mine == nil {
+		c.emit(in)
 		return
 	}
+	go func() {
+		if remote != nil {
+			in = remote()
+		}
+		if prev != nil {
+			<-prev
+		}
+		c.emit(in)
+		c.order.leave(mine)
+	}()
+}
+
+// emit runs beforeSend and hands the event to the queue (or the test sink).
+func (c *Client) emit(in CaptureInput) {
 	e, keep := c.beforeSend(newWire(in))
 	if !keep {
 		return

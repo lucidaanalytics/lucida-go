@@ -140,6 +140,7 @@ type Client struct {
 	onChange func()
 	onStale  func(error)
 
+	order    orderGate     // keeps events in call order behind a remote flag evaluation (order.go)
 	identity identityState // super properties and identify dedupe (identity.go)
 
 	ready     chan struct{}
@@ -253,6 +254,9 @@ func (c *Client) GroupIdentify(groupType, groupKey string, props map[string]any,
 
 // Flush sends everything queued, or returns ctx's error.
 func (c *Client) Flush(ctx context.Context) error {
+	if err := c.order.wait(ctx); err != nil {
+		return err
+	}
 	if c.queue == nil {
 		return nil
 	}
@@ -267,6 +271,9 @@ func (c *Client) Shutdown(ctx context.Context) error {
 			defer func() { _ = recover() }()
 			p.Shutdown()
 		}()
+	}
+	if err := c.order.wait(ctx); err != nil {
+		return err
 	}
 	if c.queue == nil {
 		return nil

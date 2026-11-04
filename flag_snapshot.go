@@ -104,15 +104,15 @@ func (c *Client) EvaluateFlags(ctx context.Context, distinctID string, o FlagOpt
 	return NewFlagSnapshot(v, p)
 }
 
-// withFlags resolves CaptureInput.Flags / SendFeatureFlags; done reports the event is handled
-// asynchronously (a remote evaluation was needed).
-func (c *Client) withFlags(in CaptureInput) (CaptureInput, bool) {
+// withFlags resolves CaptureInput.Flags / SendFeatureFlags. When a remote evaluation is needed it returns
+// remote, which blocks for the flags request and returns the input carrying them; the caller keeps event order.
+func (c *Client) withFlags(in CaptureInput) (out CaptureInput, remote func() CaptureInput) {
 	if in.Flags != nil {
 		in.Properties = flagEventProps(in.Properties, in.Flags.values)
-		return in, false
+		return in, nil
 	}
 	if !in.SendFeatureFlags {
-		return in, false
+		return in, nil
 	}
 	o := in.FlagOptions
 	if o.Groups == nil {
@@ -126,18 +126,16 @@ func (c *Client) withFlags(in CaptureInput) (CaptureInput, bool) {
 			}
 		}
 		in.Properties = flagEventProps(in.Properties, vals)
-		return in, false
+		return in, nil
 	}
 	if in.Timestamp.IsZero() {
 		in.Timestamp = time.Now()
 	}
-	// shortcut: queued after the flags request, so it may land behind later events (ordering is by timestamp)
-	go func() {
+	return in, func() CaptureInput {
 		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.Timeout)
 		defer cancel()
 		vals, _ := c.allFlags(ctx, in.DistinctID, o)
 		in.Properties, in.SendFeatureFlags = flagEventProps(in.Properties, vals), false
-		c.Capture(in)
-	}()
-	return in, true
+		return in
+	}
 }
