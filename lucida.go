@@ -27,12 +27,12 @@ const Version = "0.1.0"
 const (
 	libName      = "lucida-go"
 	minGzipBytes = 1024
-	defaultHost  = "https://app.lucida.dev"
+	defaultHost  = "https://capture.lucidace.com"
 )
 
 // Config configures a Client. Zero values pick the defaults noted.
 type Config struct {
-	Host             string        // default https://app.lucida.dev
+	Host             string        // default https://capture.lucidace.com
 	FlushAt          int           // events per batch, default 20
 	FlushInterval    time.Duration // default 5s
 	MaxQueueSize     int           // default 1000; the oldest events are dropped beyond it

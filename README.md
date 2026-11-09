@@ -3,8 +3,19 @@
 Server SDK for Lucida. Standard library only, context-aware, safe for concurrent use. Module
 `github.com/lucidaanalytics/lucida-go` (separate from the gateway's `go/go.mod`). Every call names its distinct id.
 
+## Install
+
+**Source install until the registry release** (the package is not on its registry yet):
+
+```sh
+go get github.com/lucidaanalytics/lucida-go@main
+```
+
+There is no tagged version yet, so Go resolves a pseudo-version of `main`.
+
+
 ```go
-c := lucida.New("lc_pk_...", lucida.Config{Host: "https://app.lucida.dev", SecretKey: "lc_sk_..."})
+c := lucida.New("lc_pk_...", lucida.Config{Host: "https://capture.lucidace.com", SecretKey: "lc_sk_..."})
 defer c.Shutdown(ctx) // flushes
 
 c.Capture(lucida.CaptureInput{DistinctID: "u1", Event: "purchase", Properties: map[string]any{"total": 12}})
