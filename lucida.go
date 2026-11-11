@@ -22,7 +22,7 @@ import (
 )
 
 // Version is reported as $lib_version.
-const Version = "0.1.0"
+const Version = "0.1.1"
 
 const (
 	libName      = "lucida-go"
@@ -226,10 +226,11 @@ func (c *Client) Capture(in CaptureInput) { c.CaptureContext(context.Background(
 // Identify sets person properties for distinctID. An identical call (same id and properties) already
 // sent by this client is skipped.
 func (c *Client) Identify(distinctID string, set, setOnce map[string]any) {
-	if !c.identity.first("identify", distinctID, set, setOnce) {
+	uuid, ok := c.identity.claim("identify", distinctID, set, setOnce)
+	if !ok {
 		return
 	}
-	c.Capture(CaptureInput{DistinctID: distinctID, Event: "$identify", Set: set, SetOnce: setOnce})
+	c.Capture(CaptureInput{DistinctID: distinctID, Event: "$identify", UUID: uuid, Set: set, SetOnce: setOnce})
 }
 
 // Alias links alias to distinctID.
@@ -239,7 +240,8 @@ func (c *Client) Alias(distinctID, alias string) {
 
 // GroupIdentify sets group properties. distinctID may be empty ("$<type>_<key>" is used).
 func (c *Client) GroupIdentify(groupType, groupKey string, props map[string]any, distinctID string) {
-	if !c.identity.first("group", groupType, groupKey, distinctID, props) {
+	uuid, ok := c.identity.claim("group", groupType, groupKey, distinctID, props)
+	if !ok {
 		return
 	}
 	if distinctID == "" {
@@ -248,7 +250,7 @@ func (c *Client) GroupIdentify(groupType, groupKey string, props map[string]any,
 	if props == nil {
 		props = map[string]any{}
 	}
-	c.Capture(CaptureInput{DistinctID: distinctID, Event: "$groupidentify",
+	c.Capture(CaptureInput{DistinctID: distinctID, Event: "$groupidentify", UUID: uuid,
 		Properties: map[string]any{"$group_type": groupType, "$group_key": groupKey, "$group_set": props}})
 }
 
@@ -345,11 +347,40 @@ func (c *Client) postBatch(batch []wireEvent) (int, time.Duration) {
 type ImportEvent = CaptureInput
 
 // ImportEvents sends historical events via POST /v1/s2s/batch (secret key, timestamps preserved) in
-// chunks of 1000. It returns the number accepted and an error at the first rejected chunk.
+// chunks of 1000. Registered default properties, DisableGeoip and BeforeSend apply (an event BeforeSend
+// drops is not sent). It returns the number accepted and an error at the first rejected chunk.
 func (c *Client) ImportEvents(ctx context.Context, events []ImportEvent) (int, error) {
+	return c.importEvents(ctx, events, false)
+}
+
+// ImportEventsRaw is ImportEvents without default properties, geoip flag or BeforeSend: events go as given.
+func (c *Client) ImportEventsRaw(ctx context.Context, events []ImportEvent) (int, error) {
+	return c.importEvents(ctx, events, true)
+}
+
+// importWire builds the wire event of one import, applying the client-wide defaults and BeforeSend unless raw.
+func (c *Client) importWire(in ImportEvent, raw bool) (wireEvent, bool) {
+	if raw {
+		return newWire(in), true
+	}
+	props := make(map[string]any, len(in.Properties)+2)
+	c.identity.copySuper(props)
+	for k, v := range in.Properties {
+		props[k] = v
+	}
+	in.Properties = props
+	if geo := c.cfg.DisableGeoip; (in.DisableGeoip == nil && geo) || (in.DisableGeoip != nil && *in.DisableGeoip) {
+		props["$geoip_disable"] = true
+	}
+	return c.beforeSend(newWire(in))
+}
+
+func (c *Client) importEvents(ctx context.Context, events []ImportEvent, raw bool) (int, error) {
 	if c.sink != nil {
 		for _, e := range events {
-			c.sink.add(newWire(e))
+			if w, keep := c.importWire(e, raw); keep {
+				c.sink.add(w)
+			}
 		}
 		return len(events), nil
 	}
@@ -363,7 +394,12 @@ func (c *Client) ImportEvents(ctx context.Context, events []ImportEvent) (int, e
 	for i := 0; i < len(events); i += maxBatch {
 		chunk := make([]wireEvent, 0, maxBatch)
 		for _, e := range events[i:min(i+maxBatch, len(events))] {
-			chunk = append(chunk, newWire(e))
+			if w, keep := c.importWire(e, raw); keep {
+				chunk = append(chunk, w)
+			}
+		}
+		if len(chunk) == 0 {
+			continue
 		}
 		status, _, _ := c.do(ctx, http.MethodPost, c.host+"/v1/s2s/batch",
 			map[string]any{"batch": chunk, "sent_at": time.Now().UTC().Format(time.RFC3339Nano)},

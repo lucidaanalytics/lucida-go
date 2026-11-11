@@ -52,6 +52,15 @@ func (s *lruSet) add(key string) bool {
 	return true
 }
 
+func (s *lruSet) remove(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.m[key]; ok {
+		s.l.Remove(e)
+		delete(s.m, key)
+	}
+}
+
 func (s *lruSet) len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

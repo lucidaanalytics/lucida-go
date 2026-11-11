@@ -356,6 +356,54 @@ func TestImportEvents(t *testing.T) {
 	_ = c.Shutdown(ctx5())
 }
 
+func TestImportEventsAppliesBeforeSendAndDefaultsUnlessRaw(t *testing.T) {
+	f := newFake(t)
+	c := New("k", Config{Host: f.URL, SecretKey: "lc_sk", BeforeSend: func(e CapturedEvent) *CapturedEvent {
+		if e.Event == "drop" {
+			return nil
+		}
+		return &e
+	}})
+	c.Register(map[string]any{"env": "prod"})
+	n, err := c.ImportEvents(ctx5(), []ImportEvent{{DistinctID: "u", Event: "keep"}, {DistinctID: "u", Event: "drop"}})
+	if err != nil || n != 1 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if _, err := c.ImportEventsRaw(ctx5(), []ImportEvent{{DistinctID: "u", Event: "plain"}}); err != nil {
+		t.Fatal(err)
+	}
+	evs := f.events("/v1/s2s/batch")
+	if len(evs) != 2 || evs[0]["properties"].(map[string]any)["env"] != "prod" {
+		t.Fatalf("keep: %v", evs)
+	}
+	if _, has := evs[1]["properties"].(map[string]any)["env"]; has {
+		t.Fatal("raw import must not add defaults")
+	}
+	_ = c.Shutdown(ctx5())
+}
+
+func TestIdentifyRetriedAfterDroppedBatch(t *testing.T) {
+	f := newFake(t)
+	f.respond = func(path string, n int) (int, map[string]string) {
+		if path == "/v1/batch" && n == 1 {
+			return 400, nil
+		}
+		return 0, nil
+	}
+	c := New("k", Config{Host: f.URL, FlushAt: 100})
+	c.Identify("u", map[string]any{"a": 1}, nil)
+	c.GroupIdentify("org", "acme", map[string]any{"n": 1}, "")
+	if err := c.Flush(ctx5()); err != nil {
+		t.Fatal(err)
+	}
+	c.Identify("u", map[string]any{"a": 1}, nil)
+	c.GroupIdentify("org", "acme", map[string]any{"n": 1}, "")
+	_ = c.Shutdown(ctx5())
+	if evs := f.events("/v1/batch"); len(evs) != 4 {
+		t.Fatalf("want the rejected pair plus its resend, got %d", len(evs))
+	}
+}
+
 func TestLRUSetEvictsLeastRecent(t *testing.T) {
 	s := newLRUSet(2)
 	if !s.add("a") || !s.add("b") || s.add("a") || !s.add("c") || s.len() != 2 || !s.add("b") {

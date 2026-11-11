@@ -167,5 +167,6 @@ func (c *Client) fail(err error, events []wireEvent) {
 }
 
 func (c *Client) batchDropped(batch []wireEvent, status int) {
+	c.identity.release(batch)
 	c.fail(&DeliveryError{Status: status, Dropped: len(batch)}, batch)
 }

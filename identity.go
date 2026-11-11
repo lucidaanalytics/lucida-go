@@ -15,17 +15,46 @@ type identityState struct {
 	super map[string]any
 	once  sync.Once
 	seen  *lruSet
+	keys  map[string]string // event uuid -> dedupe key, until the batch is dropped
 }
 
-// first reports whether this exact call (kind plus id and property values) is new to the process.
-func (s *identityState) first(parts ...any) bool {
-	s.once.Do(func() { s.seen = newLRUSet(identityDedupeSize) })
+// claim reports whether this exact call (kind plus id and property values) is new to the process and, if so,
+// the uuid to send its event under. release frees the call again when that event's batch is dropped.
+func (s *identityState) claim(parts ...any) (uuid string, ok bool) {
+	s.once.Do(func() { s.seen = newLRUSet(identityDedupeSize); s.keys = map[string]string{} })
+	uuid = uuidV7()
 	raw, err := json.Marshal(parts)
 	if err != nil {
-		return true // unhashable properties: never suppress
+		return uuid, true // unhashable properties: never suppress
 	}
 	sum := sha256.Sum256(raw)
-	return s.seen.add(hex.EncodeToString(sum[:]))
+	key := hex.EncodeToString(sum[:])
+	if !s.seen.add(key) {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.keys) >= identityDedupeSize {
+		for k := range s.keys { // bounded like the set; an evicted uuid just stays deduped
+			delete(s.keys, k)
+			break
+		}
+	}
+	s.keys[uuid] = key
+	return uuid, true
+}
+
+// release forgets the calls whose events were in a dropped batch, so repeating them is sent again.
+func (s *identityState) release(batch []wireEvent) {
+	s.once.Do(func() { s.seen = newLRUSet(identityDedupeSize); s.keys = map[string]string{} })
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range batch {
+		if key, ok := s.keys[e.UUID]; ok {
+			delete(s.keys, e.UUID)
+			s.seen.remove(key)
+		}
+	}
 }
 
 func (s *identityState) copySuper(dst map[string]any) {
